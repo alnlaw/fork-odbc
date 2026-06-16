@@ -65,38 +65,21 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		buflen = api.SQLLEN(l)
 		plen = p.StoreStrLen_or_IndPtr(buflen)
 		if !conn.isMSAccessDriver {
-			switch {
-			case size >= 4000:
-				sqltype = api.SQL_WLONGVARCHAR
-			case p.isDescribed:
-				sqltype = p.SQLType
-			case size <= 1:
-				sqltype = api.SQL_WVARCHAR
-			default:
-				sqltype = api.SQL_WCHAR
-			}
+			sqltype, size, decimal = stringParamBinding(size, p)
 		} else {
 			// MS Acess requires SQL_WLONGVARCHAR for MEMO.
 			// https://docs.microsoft.com/en-us/sql/odbc/microsoft/microsoft-access-data-types
 			sqltype = api.SQL_WLONGVARCHAR
 		}
 	case int64:
-		if -0x80000000 < d && d < 0x7fffffff {
-			// Some ODBC drivers do not support SQL_BIGINT.
-			// Use SQL_INTEGER if the value fit in int32.
-			// See issue #78 for details.
+		ctype, sqltype, size, decimal = intParamBinding(d, p)
+		if ctype == api.SQL_C_LONG {
 			d2 := int32(d)
-			ctype = api.SQL_C_LONG
 			p.Data = &d2
 			buf = unsafe.Pointer(&d2)
-			sqltype = api.SQL_INTEGER
-			size = 4
 		} else {
-			ctype = api.SQL_C_SBIGINT
 			p.Data = &d
 			buf = unsafe.Pointer(&d)
-			sqltype = api.SQL_BIGINT
-			size = 8
 		}
 	case bool:
 		var b byte
@@ -118,13 +101,13 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		ctype = api.SQL_C_TYPE_TIMESTAMP
 		y, m, day := d.Date()
 		b := api.SQL_TIMESTAMP_STRUCT{
-			Year:     api.SQLSMALLINT(y),
-			Month:    api.SQLUSMALLINT(m),
-			Day:      api.SQLUSMALLINT(day),
-			Hour:     api.SQLUSMALLINT(d.Hour()),
-			Minute:   api.SQLUSMALLINT(d.Minute()),
-			Second:   api.SQLUSMALLINT(d.Second()),
-			Fraction: api.SQLUINTEGER(d.Nanosecond()),
+			Year:   api.SQLSMALLINT(y),
+			Month:  api.SQLUSMALLINT(m),
+			Day:    api.SQLUSMALLINT(day),
+			Hour:   api.SQLUSMALLINT(d.Hour()),
+			Minute: api.SQLUSMALLINT(d.Minute()),
+			Second: api.SQLUSMALLINT(d.Second()),
+			// Fraction is set below, once the scale (decimal) is known.
 		}
 		p.Data = &b
 		buf = unsafe.Pointer(&b)
@@ -136,6 +119,14 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 			// represented as yyyy-mm-dd hh:mm:ss.fff format in ms sql server
 			decimal = 3
 		}
+		// The SQL_TIMESTAMP_STRUCT.Fraction is in billionths of a second, but it
+		// must carry no more precision than the scale (decimal) we declare to
+		// SQLBindParameter. Some ODBC drivers reject an over-precise fraction
+		// with "Datetime field overflow" (SQLSTATE 22008) — e.g. a microsecond
+		// timestamp (Nanosecond()=123456000) bound at scale 3. Round the fraction
+		// down to `decimal` significant digits so it stays a clean multiple, as
+		// pyodbc does.
+		b.Fraction = api.SQLUINTEGER(truncateFraction(d.Nanosecond(), int(decimal)))
 		size = 20 + api.SQLULEN(decimal)
 	case []byte:
 		ctype = api.SQL_C_BINARY
@@ -170,6 +161,70 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		return NewError("SQLBindParameter", h)
 	}
 	return nil
+}
+
+// intParamBinding picks the C type, SQL type, column size and scale for binding
+// an int64 parameter. When the driver described the parameter, honor the
+// column's real SQL type/precision/scale — every other branch in BindValue
+// already does this. Ignoring it under-declares the parameter (e.g.
+// SQL_INTEGER with size 4 for a wide DECIMAL id column) and makes some ODBC
+// drivers reject in-range values with SQLSTATE 22003 ("Numeric value
+// out of range"). The C value always fits SQL_C_SBIGINT, so the driver converts
+// it to the described type. Without a description, fall back to the value-magnitude
+// heuristic: SQL_INTEGER when it fits int32 (some drivers don't support
+// SQL_BIGINT, see issue #78), else SQL_BIGINT.
+func intParamBinding(d int64, p *Parameter) (ctype, sqltype api.SQLSMALLINT, size api.SQLULEN, decimal api.SQLSMALLINT) {
+	if p.isDescribed {
+		return api.SQL_C_SBIGINT, p.SQLType, p.Size, p.Decimal
+	}
+	if -0x80000000 < d && d < 0x7fffffff {
+		return api.SQL_C_LONG, api.SQL_INTEGER, 4, 0
+	}
+	return api.SQL_C_SBIGINT, api.SQL_BIGINT, 8, 0
+}
+
+// stringParamBinding decides the SQL type / column size / scale for a string
+// parameter. Decimals travel as text (database/sql has no decimal driver.Value),
+// so a described DECIMAL/NUMERIC param must declare the column's real
+// precision/scale — not the text length with scale 0 — or some ODBC drivers
+// truncate the fractional digits with SQLSTATE 22001 ("String data, right
+// truncated"). Mirrors intParamBinding, which honors the described type too.
+func stringParamBinding(strLen api.SQLULEN, p *Parameter) (sqltype api.SQLSMALLINT, size api.SQLULEN, decimal api.SQLSMALLINT) {
+	switch {
+	case strLen >= 4000:
+		return api.SQL_WLONGVARCHAR, strLen, 0
+	case p.isDescribed && isNumericSQLType(p.SQLType):
+		return p.SQLType, p.Size, p.Decimal
+	case p.isDescribed:
+		return p.SQLType, strLen, 0
+	case strLen <= 1:
+		return api.SQL_WVARCHAR, strLen, 0
+	default:
+		return api.SQL_WCHAR, strLen, 0
+	}
+}
+
+func isNumericSQLType(t api.SQLSMALLINT) bool {
+	return t == api.SQL_DECIMAL || t == api.SQL_NUMERIC
+}
+
+// truncateFraction rounds a sub-second value (nanoseconds, 0..999999999) down to
+// `scale` fractional digits, returned in nanoseconds. scale<=0 yields 0; scale>=9
+// leaves it unchanged. So scale=3 keeps milliseconds (a multiple of 1e6), scale=6
+// keeps microseconds (a multiple of 1e3) — matching what the bound DecimalDigits
+// promises, so drivers don't see an over-precise fraction.
+func truncateFraction(ns, scale int) int {
+	if scale <= 0 {
+		return 0
+	}
+	if scale >= 9 {
+		return ns
+	}
+	div := 1
+	for i := 0; i < 9-scale; i++ {
+		div *= 10
+	}
+	return (ns / div) * div
 }
 
 func ExtractParameters(h api.SQLHSTMT) ([]Parameter, error) {

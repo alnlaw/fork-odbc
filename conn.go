@@ -75,6 +75,17 @@ func (c *Conn) newError(apiName string, handle interface{}) error {
 	return err
 }
 
+// IsValid implements driver.Validator. database/sql calls it before returning a
+// connection to the pool; a false result makes the pool drop (and replace) the
+// connection instead of reusing it. We flag a connection bad on fatal ODBC
+// errors (newError, above) and after a context cancel interrupts an in-flight
+// statement via SQLCancel (waitQuery/waitExec) — once a statement has been
+// cancelled mid-execution the connection's state is uncertain, so it's safer to
+// discard it than to hand it to the next caller.
+func (c *Conn) IsValid() bool {
+	return !c.bad
+}
+
 // QueryContext implements the driver.QueryerContext interface.
 // As per the specifications, it honours the context timeout and returns when the context is cancelled.
 // When the context is cancelled, it first cancels the statement, closes it, and then returns an error.
@@ -135,14 +146,99 @@ func (c *Conn) waitQuery(ctx context.Context, os *ODBCStmt, rowsChan <-chan driv
 		select {
 		// ignore the ODBC error and return ctx.Err() instead
 		case <-errorChan:
+			// SQLCancel actually interrupted the statement: the connection's
+			// state is uncertain, so flag it for the pool to discard (IsValid).
+			c.bad = true
 			return nil, ctx.Err()
 		case rows := <-rowsChan:
+			// query finished before the cancel took effect — connection is fine
 			return rows, nil
 		}
 	case err := <-errorChan:
 		return nil, err
 	case rows := <-rowsChan:
 		return rows, nil
+	}
+}
+
+// ExecContext implements the driver.ExecerContext interface.
+// It mirrors QueryContext: the statement runs in a goroutine while the caller
+// waits on ctx, so a cancelled/expired context cancels the in-flight statement
+// (SQLCancel) instead of blocking until the driver returns. Without this, an
+// Exec (INSERT/UPDATE/DELETE/DDL or executemany) would ignore the request
+// deadline entirely — only reads (QueryContext) were cancellable upstream.
+func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	dargs, err := namedValueToValue(args)
+	if err != nil {
+		return nil, err
+	}
+	os, err := c.PrepareODBCStmt(query)
+	if err != nil {
+		return nil, err
+	}
+	defer os.closeByStmt()
+
+	// check if context is canceled before executing the statement
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	resChan := make(chan driver.Result)
+	errorChan := make(chan error)
+	go func() {
+		res, err := c.wrapExec(os, dargs)
+		if err != nil {
+			errorChan <- err
+			return
+		}
+		resChan <- res
+	}()
+	return c.waitExec(ctx, os, resChan, errorChan)
+}
+
+// wrapExec follows the same logic as `stmt.Exec()` (execute, then sum row
+// counts across result sets) except it takes no lock, because the ODBC
+// statement is never exposed externally.
+func (c *Conn) wrapExec(os *ODBCStmt, dargs []driver.Value) (driver.Result, error) {
+	if err := os.Exec(dargs, c); err != nil {
+		return nil, err
+	}
+	var sumRowCount int64
+	for {
+		var rc api.SQLLEN
+		ret := api.SQLRowCount(os.h, &rc)
+		if IsError(ret) {
+			return nil, NewError("SQLRowCount", os.h)
+		}
+		sumRowCount += int64(rc)
+		if ret = api.SQLMoreResults(os.h); ret == api.SQL_NO_DATA {
+			break
+		}
+	}
+	return &Result{rowCount: sumRowCount}, nil
+}
+
+// waitExec waits for the result or error from the goroutine, or for ctx to
+// signal completion. On cancellation it cancels the statement and returns
+// ctx.Err(), matching waitQuery's behaviour.
+func (c *Conn) waitExec(ctx context.Context, os *ODBCStmt, resChan <-chan driver.Result, errorChan <-chan error) (driver.Result, error) {
+	select {
+	case <-ctx.Done():
+		// context cancelled/expired: cancel the statement, ignore its error
+		os.Cancel()
+		select {
+		case <-errorChan:
+			// SQLCancel interrupted the statement; discard the connection (IsValid).
+			c.bad = true
+			return nil, ctx.Err()
+		case res := <-resChan:
+			// exec finished before the cancel took effect — connection is fine
+			return res, nil
+		}
+	case err := <-errorChan:
+		return nil, err
+	case res := <-resChan:
+		return res, nil
 	}
 }
 
