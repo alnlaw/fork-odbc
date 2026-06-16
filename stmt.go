@@ -5,6 +5,7 @@
 package odbc
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"sync"
@@ -78,6 +79,49 @@ func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
 		}
 	}
 	return &Result{rowCount: sumRowCount}, nil
+}
+
+// ExecContext implements driver.StmtExecContext so a prepared statement's
+// Exec honours the context. Without it, database/sql falls back to the
+// uncancellable Stmt.Exec above — and an executemany-style path
+// (PrepareContext + looped stmt.ExecContext) would then leave its
+// INSERT/UPDATE/DELETE statements uncancellable.
+// It reuses Conn.wrapExec/waitExec (see conn.go): run in a goroutine, wait on
+// ctx, and SQLCancel the in-flight statement on cancellation.
+func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	dargs, err := namedValueToValue(args)
+	if err != nil {
+		return nil, err
+	}
+	if s.os == nil {
+		return nil, errors.New("Stmt is closed")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.os.usedByRows {
+		s.os.closeByStmt()
+		s.os = nil
+		os, err := s.c.PrepareODBCStmt(s.query)
+		if err != nil {
+			return nil, err
+		}
+		s.os = os
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	resChan := make(chan driver.Result)
+	errorChan := make(chan error)
+	go func() {
+		res, err := s.c.wrapExec(s.os, dargs)
+		if err != nil {
+			errorChan <- err
+			return
+		}
+		resChan <- res
+	}()
+	return s.c.waitExec(ctx, s.os, resChan, errorChan)
 }
 
 func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {

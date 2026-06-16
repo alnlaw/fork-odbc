@@ -37,6 +37,11 @@ type Column interface {
 	Name() string
 	Bind(h api.SQLHSTMT, idx int) (bool, error)
 	Value(h api.SQLHSTMT, idx int) (driver.Value, error)
+	// SQLTypeCode returns the column's ODBC SQL type (SQL_TYPE_DATE,
+	// SQL_TYPE_TIMESTAMP, SQL_DECIMAL, ...) so callers can expose database/sql
+	// DatabaseTypeName — the driver otherwise collapses e.g. DATE and TIMESTAMP
+	// into the same Go time.Time, losing the distinction.
+	SQLTypeCode() api.SQLSMALLINT
 }
 
 func describeColumn(h api.SQLHSTMT, idx int, namebuf []uint16) (namelen int, sqltype api.SQLSMALLINT, size api.SQLULEN, ret api.SQLRETURN) {
@@ -119,6 +124,11 @@ type BaseColumn struct {
 
 func (c *BaseColumn) Name() string {
 	return c.name
+}
+
+// SQLTypeCode returns the column's ODBC SQL type.
+func (c *BaseColumn) SQLTypeCode() api.SQLSMALLINT {
+	return c.SQLType
 }
 
 func (c *BaseColumn) Value(buf []byte) (driver.Value, error) {
